@@ -12,13 +12,15 @@ class DownloaderThread(QThread):
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal()
 
-    def __init__(self, base_url, output_folder, start_index, token, prefix):
+    def __init__(self, base_url, output_folder, start_index, token, prefix, mode, number_format):
         QThread.__init__(self)
         self.base_url = base_url
         self.output_folder = output_folder
         self.start_index = start_index
         self.token = token
         self.prefix = prefix
+        self.mode = mode
+        self.number_format = number_format
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
@@ -31,7 +33,10 @@ class DownloaderThread(QThread):
         }
 
     def run(self):
-        self.download_files_from_cdn()
+        if self.mode == 'cdn':
+            self.download_files_from_cdn()
+        elif self.mode == 'mitaku':
+            self.download_files_from_mitaku()
         self.finished_signal.emit()
 
     def download_files_from_cdn(self):
@@ -43,8 +48,8 @@ class DownloaderThread(QThread):
         total_downloaded = 0
         image_formats = ['.jpg', '.jpeg', '.webp', '.png']  # Supported formats
 
-        while consecutive_failures < 8:  # Stop after 8 consecutive failures
-            file_name = f"{self.prefix}-{index:03d}"
+        while consecutive_failures < 5:  # Stop after 5 consecutive failures
+            file_name = f"{self.prefix}-{index:0{self.number_format}d}"
 
             successful_download = False
 
@@ -84,6 +89,39 @@ class DownloaderThread(QThread):
             # Update progress (Optional since the end is unknown, update based on attempts)
             self.progress_signal.emit(index)
 
+    def download_files_from_mitaku(self):
+        os.makedirs(self.output_folder, exist_ok=True)
+        session = requests.Session()
+
+        consecutive_failures = 0
+        index = self.start_index
+        total_downloaded = 0
+
+        while consecutive_failures < 8:  # Stop after 8 consecutive failures
+            url = f"{self.base_url}/{self.prefix}-{index}.jpg"
+            file_name = f"{self.prefix}-{index:0{self.number_format}d}.jpg"
+            save_path = os.path.join(self.output_folder, file_name)
+            self.update_signal.emit(f"Attempting to download: {url}")
+
+            try:
+                response = session.get(url, headers=self.headers, timeout=10)
+                response.raise_for_status()
+
+                with open(save_path, 'wb') as file:
+                    file.write(response.content)
+                self.update_signal.emit(f"Downloaded: {save_path}")
+
+                consecutive_failures = 0  # Reset failure count after successful download
+                total_downloaded += 1
+            except requests.exceptions.RequestException as e:
+                self.update_signal.emit(f"Failed to download: {url}")
+                self.update_signal.emit(f"Error: {str(e)}")
+                consecutive_failures += 1
+
+            index += 1
+            # Update progress (Optional since the end is unknown, update based on attempts)
+            self.progress_signal.emit(index)
+
 class CDNDownloaderGUI(QWidget):
     def __init__(self):
         super().__init__()
@@ -95,20 +133,23 @@ class CDNDownloaderGUI(QWidget):
 
         layout = QVBoxLayout()
 
-        # Radio buttons for choosing mode (Manual or Full Link)
+        # Radio buttons for choosing mode (Manual, Full Link, or Mitaku)
         self.mode_label = QLabel('Choose Mode:')
         layout.addWidget(self.mode_label)
 
         self.manual_radio = QRadioButton('Manual (Base URL, Token, Prefix)')
         self.full_link_radio = QRadioButton('Full Link (auto-extract)')
+        self.mitaku_radio = QRadioButton('Mitaku Link')
         self.manual_radio.setChecked(True)
 
         self.button_group = QButtonGroup()
         self.button_group.addButton(self.manual_radio)
         self.button_group.addButton(self.full_link_radio)
+        self.button_group.addButton(self.mitaku_radio)
 
         layout.addWidget(self.manual_radio)
         layout.addWidget(self.full_link_radio)
+        layout.addWidget(self.mitaku_radio)
 
         self.full_link_label = QLabel('Enter Full Link:')
         layout.addWidget(self.full_link_label)
@@ -156,6 +197,16 @@ class CDNDownloaderGUI(QWidget):
         self.start_index_input.setValue(1)
         layout.addWidget(self.start_index_input)
 
+        # Add new input for number format
+        self.number_format_label = QLabel('Number Format (digits):')
+        layout.addWidget(self.number_format_label)
+
+        self.number_format_input = QSpinBox()
+        self.number_format_input.setMinimum(1)
+        self.number_format_input.setMaximum(8)
+        self.number_format_input.setValue(3)
+        layout.addWidget(self.number_format_input)
+
         self.download_button = QPushButton('Start Download')
         self.download_button.clicked.connect(self.start_download)
         layout.addWidget(self.download_button)
@@ -171,10 +222,21 @@ class CDNDownloaderGUI(QWidget):
 
         # Set visibility of full link vs manual fields based on selection
         self.full_link_radio.toggled.connect(self.toggle_mode)
+        self.mitaku_radio.toggled.connect(self.toggle_mode)
+        self.manual_radio.toggled.connect(self.toggle_mode)
 
     def toggle_mode(self):
         # Toggle visibility based on the selected mode
         if self.full_link_radio.isChecked():
+            self.full_link_label.setVisible(True)
+            self.full_link_input.setVisible(True)
+            self.url_label.setVisible(False)
+            self.url_input.setVisible(False)
+            self.token_label.setVisible(False)
+            self.token_input.setVisible(False)
+            self.prefix_label.setVisible(False)
+            self.prefix_input.setVisible(False)
+        elif self.mitaku_radio.isChecked():
             self.full_link_label.setVisible(True)
             self.full_link_input.setVisible(True)
             self.url_label.setVisible(False)
@@ -200,35 +262,43 @@ class CDNDownloaderGUI(QWidget):
 
     def extract_url_parts(self, full_link):
         parsed_url = urlparse.urlparse(full_link)
-        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.rsplit('/', 1)[0]}"
-        token = parsed_url.query
-        file_name = parsed_url.path.rsplit('/', 1)[-1]
-        prefix = file_name[:file_name.rfind('-')]
-        return base_url, token, prefix
+        if 'mitaku.net' in parsed_url.netloc:
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}/wp-content/uploads/{parsed_url.path.split('/')[3]}/{parsed_url.path.split('/')[4]}"
+            file_name = parsed_url.path.split('/')[-1]
+            prefix = '-'.join(file_name.split('-')[:-1])
+            return base_url, '', prefix, 'mitaku'
+        else:
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.rsplit('/', 1)[0]}"
+            token = parsed_url.query
+            file_name = parsed_url.path.rsplit('/', 1)[-1]
+            prefix = file_name[:file_name.rfind('-')]
+            return base_url, token, prefix, 'cdn'
 
     def start_download(self):
-        if self.full_link_radio.isChecked():
+        if self.full_link_radio.isChecked() or self.mitaku_radio.isChecked():
             full_link = self.full_link_input.text()
             if not full_link:
                 self.log_output.append("Please enter a full link.")
                 return
-            cdn_url, token, prefix = self.extract_url_parts(full_link)
+            cdn_url, token, prefix, mode = self.extract_url_parts(full_link)
         else:
             cdn_url = self.url_input.text()
             token = self.token_input.text()
             prefix = self.prefix_input.text()
+            mode = 'cdn'
 
         output_folder = self.folder_input.text()
         start_index = self.start_index_input.value()
+        number_format = self.number_format_input.value()
 
-        if not cdn_url or not output_folder or not token or not prefix:
+        if not cdn_url or not output_folder or (mode == 'cdn' and not token) or not prefix:
             self.log_output.append("Please complete all fields.")
             return
 
         self.download_button.setEnabled(False)
         self.log_output.clear()
 
-        self.downloader_thread = DownloaderThread(cdn_url, output_folder, start_index, token, prefix)
+        self.downloader_thread = DownloaderThread(cdn_url, output_folder, start_index, token, prefix, mode, number_format)
         self.downloader_thread.update_signal.connect(self.log_output.append)
         self.downloader_thread.progress_signal.connect(self.update_progress)
         self.downloader_thread.finished_signal.connect(self.download_finished)
