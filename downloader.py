@@ -1,7 +1,7 @@
 import os
 import sys
 import requests
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog, QSpinBox, QProgressBar, QRadioButton, QButtonGroup
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog, QSpinBox, QRadioButton, QButtonGroup
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PIL import Image
 from io import BytesIO
@@ -9,7 +9,6 @@ import urllib.parse as urlparse
 
 class DownloaderThread(QThread):
     update_signal = pyqtSignal(str)
-    progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal()
 
     def __init__(self, base_url, output_folder, start_index, token, prefix, mode, number_format):
@@ -31,96 +30,76 @@ class DownloaderThread(QThread):
             'Upgrade-Insecure-Requests': '1',
             'Referer': 'https://buondua.com/'
         }
+        self.session = requests.Session()
+        self.image_formats = [
+            '.jpg', '.jpeg', '.webp', '.png', '.gif', '.bmp',
+            '.tiff', '.tif', '.heic', '.heif', '.avif'
+        ]
 
     def run(self):
-        if self.mode == 'cdn':
-            self.download_files_from_cdn()
-        elif self.mode == 'mitaku':
-            self.download_files_from_mitaku()
+        self.download_files()
         self.finished_signal.emit()
 
-    def download_files_from_cdn(self):
+    def download_file(self, url, save_path, file_name, ext=None):
+        try:
+            response = self.session.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+
+            # Always save as .jpeg
+            save_path_jpeg = os.path.join(self.output_folder, f"{file_name}.jpeg")
+
+            # For all formats, including .jpg and .jpeg, process through PIL
+            self.update_signal.emit(f"Processing {ext} to .jpeg")
+            img = Image.open(BytesIO(response.content))
+
+            # Convert to RGB mode if the image is not already in RGB
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            img.save(save_path_jpeg, 'JPEG', quality=95)
+            self.update_signal.emit(f"Saved as .jpeg: {save_path_jpeg}")
+            return True
+        except requests.exceptions.RequestException as e:
+            self.update_signal.emit(f"Failed to download: {url} (Format: {ext})")
+            self.update_signal.emit(f"Error: {str(e)}")
+            return False
+        except Exception as e:
+            self.update_signal.emit(f"Failed to process image: {url} (Format: {ext})")
+            self.update_signal.emit(f"Error: {str(e)}")
+            return False
+
+    def download_files(self):
         os.makedirs(self.output_folder, exist_ok=True)
-        session = requests.Session()
 
         consecutive_failures = 0
         index = self.start_index
-        total_downloaded = 0
-        image_formats = ['.jpg', '.jpeg', '.webp', '.png']  # Supported formats
 
-        while consecutive_failures < 5:  # Stop after 5 consecutive failures
+        while consecutive_failures < 5:
             file_name = f"{self.prefix}-{index:0{self.number_format}d}"
+            success = False
 
-            successful_download = False
+            for ext in self.image_formats:
+                if self.mode == 'cdn':
+                    url = f"{self.base_url}/{file_name}{ext}?{self.token}"
+                else:  # mitaku mode
+                    url = f"{self.base_url}/{file_name}{ext}"
 
-            for ext in image_formats:
-                url = f"{self.base_url}/{file_name}{ext}?{self.token}"
                 save_path = os.path.join(self.output_folder, f"{file_name}{ext}")
                 self.update_signal.emit(f"Attempting to download: {url}")
 
-                try:
-                    response = session.get(url, headers=self.headers, timeout=10)
-                    response.raise_for_status()
+                if self.download_file(url, save_path, file_name, ext):
+                    success = True
+                    break  # Stop trying other formats if one succeeds
 
-                    # Handle image conversion
-                    if ext != '.jpg' and ext != '.jpeg':
-                        self.update_signal.emit(f"Converting {ext} to .jpg")
-                        img = Image.open(BytesIO(response.content))
-                        save_path_jpg = os.path.join(self.output_folder, f"{file_name}.jpg")
-                        img.convert('RGB').save(save_path_jpg, 'JPEG')
-                        self.update_signal.emit(f"Converted and saved: {save_path_jpg}")
-                    else:
-                        with open(save_path, 'wb') as file:
-                            file.write(response.content)
-                        self.update_signal.emit(f"Downloaded: {save_path}")
-
-                    successful_download = True
-                    consecutive_failures = 0  # Reset failure count after successful download
-                    total_downloaded += 1
-                    break  # Exit the loop if one format succeeds
-                except requests.exceptions.RequestException as e:
-                    self.update_signal.emit(f"Failed to download: {url} (Format: {ext})")
-                    self.update_signal.emit(f"Error: {str(e)}")
-
-            if not successful_download:
+            if success:
+                consecutive_failures = 0
+            else:
                 consecutive_failures += 1
+                self.update_signal.emit(f"Failed to download any format for {file_name}")
 
             index += 1
-            # Update progress (Optional since the end is unknown, update based on attempts)
-            self.progress_signal.emit(index)
 
-    def download_files_from_mitaku(self):
-        os.makedirs(self.output_folder, exist_ok=True)
-        session = requests.Session()
-
-        consecutive_failures = 0
-        index = self.start_index
-        total_downloaded = 0
-
-        while consecutive_failures < 8:  # Stop after 8 consecutive failures
-            url = f"{self.base_url}/{self.prefix}-{index}.jpg"
-            file_name = f"{self.prefix}-{index:0{self.number_format}d}.jpg"
-            save_path = os.path.join(self.output_folder, file_name)
-            self.update_signal.emit(f"Attempting to download: {url}")
-
-            try:
-                response = session.get(url, headers=self.headers, timeout=10)
-                response.raise_for_status()
-
-                with open(save_path, 'wb') as file:
-                    file.write(response.content)
-                self.update_signal.emit(f"Downloaded: {save_path}")
-
-                consecutive_failures = 0  # Reset failure count after successful download
-                total_downloaded += 1
-            except requests.exceptions.RequestException as e:
-                self.update_signal.emit(f"Failed to download: {url}")
-                self.update_signal.emit(f"Error: {str(e)}")
-                consecutive_failures += 1
-
-            index += 1
-            # Update progress (Optional since the end is unknown, update based on attempts)
-            self.progress_signal.emit(index)
+        self.update_signal.emit(f"Download finished. Stopped after {consecutive_failures} consecutive failures.")
 
 class CDNDownloaderGUI(QWidget):
     def __init__(self):
@@ -133,7 +112,6 @@ class CDNDownloaderGUI(QWidget):
 
         layout = QVBoxLayout()
 
-        # Radio buttons for choosing mode (Manual, Full Link, or Mitaku)
         self.mode_label = QLabel('Choose Mode:')
         layout.addWidget(self.mode_label)
 
@@ -197,7 +175,6 @@ class CDNDownloaderGUI(QWidget):
         self.start_index_input.setValue(1)
         layout.addWidget(self.start_index_input)
 
-        # Add new input for number format
         self.number_format_label = QLabel('Number Format (digits):')
         layout.addWidget(self.number_format_label)
 
@@ -211,49 +188,28 @@ class CDNDownloaderGUI(QWidget):
         self.download_button.clicked.connect(self.start_download)
         layout.addWidget(self.download_button)
 
-        self.progress_bar = QProgressBar()
-        layout.addWidget(self.progress_bar)
-
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         layout.addWidget(self.log_output)
 
         self.setLayout(layout)
 
-        # Set visibility of full link vs manual fields based on selection
         self.full_link_radio.toggled.connect(self.toggle_mode)
         self.mitaku_radio.toggled.connect(self.toggle_mode)
         self.manual_radio.toggled.connect(self.toggle_mode)
 
+        self.toggle_mode()  # Initialize visibility
+
     def toggle_mode(self):
-        # Toggle visibility based on the selected mode
-        if self.full_link_radio.isChecked():
-            self.full_link_label.setVisible(True)
-            self.full_link_input.setVisible(True)
-            self.url_label.setVisible(False)
-            self.url_input.setVisible(False)
-            self.token_label.setVisible(False)
-            self.token_input.setVisible(False)
-            self.prefix_label.setVisible(False)
-            self.prefix_input.setVisible(False)
-        elif self.mitaku_radio.isChecked():
-            self.full_link_label.setVisible(True)
-            self.full_link_input.setVisible(True)
-            self.url_label.setVisible(False)
-            self.url_input.setVisible(False)
-            self.token_label.setVisible(False)
-            self.token_input.setVisible(False)
-            self.prefix_label.setVisible(False)
-            self.prefix_input.setVisible(False)
-        else:
-            self.full_link_label.setVisible(False)
-            self.full_link_input.setVisible(False)
-            self.url_label.setVisible(True)
-            self.url_input.setVisible(True)
-            self.token_label.setVisible(True)
-            self.token_input.setVisible(True)
-            self.prefix_label.setVisible(True)
-            self.prefix_input.setVisible(True)
+        full_link_mode = self.full_link_radio.isChecked() or self.mitaku_radio.isChecked()
+        self.full_link_label.setVisible(full_link_mode)
+        self.full_link_input.setVisible(full_link_mode)
+        self.url_label.setVisible(not full_link_mode)
+        self.url_input.setVisible(not full_link_mode)
+        self.token_label.setVisible(not full_link_mode)
+        self.token_input.setVisible(not full_link_mode)
+        self.prefix_label.setVisible(not full_link_mode)
+        self.prefix_input.setVisible(not full_link_mode)
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -300,15 +256,10 @@ class CDNDownloaderGUI(QWidget):
 
         self.downloader_thread = DownloaderThread(cdn_url, output_folder, start_index, token, prefix, mode, number_format)
         self.downloader_thread.update_signal.connect(self.log_output.append)
-        self.downloader_thread.progress_signal.connect(self.update_progress)
         self.downloader_thread.finished_signal.connect(self.download_finished)
         self.downloader_thread.start()
 
-    def update_progress(self, value):
-        self.progress_bar.setValue(value)
-
     def download_finished(self):
-        self.log_output.append("Download finished.")
         self.download_button.setEnabled(True)
 
 if __name__ == '__main__':
